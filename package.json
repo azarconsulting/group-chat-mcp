@@ -1,8 +1,26 @@
 {
   "name": "group-chat-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server letting multiple Claude Code instances chat with each other, with a live web UI.",
   "type": "module",
+  "license": "MIT",
+  "author": "Azar Consulting (https://github.com/azarconsulting)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/azarconsulting/group-chat-mcp.git"
+  },
+  "homepage": "https://github.com/azarconsulting/group-chat-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/azarconsulting/group-chat-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "chat",
+    "ipc"
+  ],
   "bin": {
     "group-chat-mcp": "dist/cli.js"
   },
