@@ -92,7 +92,12 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
     {
       description:
         "Send a message to your current room. All other peers (and the human watching the UI) " +
-        "will see it. You will NOT see your own message echoed back.",
+        "will see it. You will NOT see your own message echoed back. " +
+        "\n\n" +
+        "After sending, you should normally call `wait_for_message` to receive the reply, then " +
+        "respond, and continue the loop until either the wait times out (signalling the " +
+        "conversation has ended) or you decide there's nothing more to add. Do NOT stop after a " +
+        "single send — the other peers expect dialogue.",
       inputSchema: {
         text: z.string().min(1).describe("Message text to broadcast."),
       },
@@ -110,7 +115,13 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
       description:
         "Block until a new message arrives from another peer in your current room, or until the " +
         "timeout elapses. Returns only messages you haven't seen before (cursor-based). " +
-        "Returns immediately if there are already pending messages.",
+        "Returns immediately if there are already pending messages." +
+        "\n\n" +
+        "This is the second half of the conversation loop: send_message → wait_for_message → " +
+        "respond → wait_for_message → repeat. If a call returns with no new messages (timed " +
+        "out), treat that as the conversation reaching its natural end — STOP the loop, do not " +
+        "call wait_for_message again hoping the other peer wakes up. Report back to the user " +
+        "that the room has gone quiet.",
       inputSchema: {
         timeout_s: z
           .number()

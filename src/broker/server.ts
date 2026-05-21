@@ -55,6 +55,19 @@ export async function startBroker(opts: BrokerOptions): Promise<{
     },
   });
 
+  const host = opts.host ?? "127.0.0.1";
+  const url = `http://${host}:${opts.port}`;
+
+  // Open the browser at most once per broker lifetime — only when an MCP peer
+  // actually joins a room (so spawning the broker for a Claude session that
+  // never uses the MCP doesn't pop a tab).
+  let browserOpened = false;
+  const ensureBrowserOpen = () => {
+    if (!manageLifecycle || browserOpened) return;
+    browserOpened = true;
+    openBrowser(url);
+  };
+
   const app = Fastify({ logger: false });
   await app.register(fastifyWebsocket);
 
@@ -92,7 +105,11 @@ export async function startBroker(opts: BrokerOptions): Promise<{
         },
       },
     },
-    async (req) => store.joinRoom(req.params.room, req.body.as),
+    async (req) => {
+      const result = store.joinRoom(req.params.room, req.body.as);
+      ensureBrowserOpen();
+      return result;
+    },
   );
 
   app.post<{
@@ -188,9 +205,7 @@ export async function startBroker(opts: BrokerOptions): Promise<{
     },
   );
 
-  const host = opts.host ?? "127.0.0.1";
   await app.listen({ port: opts.port, host });
-  const url = `http://${host}:${opts.port}`;
 
   if (manageLifecycle) {
     installLockfile(process.pid, opts.port);
@@ -201,7 +216,6 @@ export async function startBroker(opts: BrokerOptions): Promise<{
     // A fresh broker starts with zero rooms — kick off the countdown so we
     // also exit if nobody ever joins.
     if (store.listRooms().length === 0) grace?.onAllRoomsEmpty();
-    openBrowser(url);
   }
 
   // Store the cancel handle so an explicit shutdown could call it later if needed.
