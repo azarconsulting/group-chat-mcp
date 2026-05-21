@@ -1,0 +1,29 @@
+{
+  "name": "group-chat-mcp",
+  "version": "0.1.0",
+  "description": "MCP server letting multiple Claude Code instances chat with each other, with a live web UI.",
+  "type": "module",
+  "bin": {
+    "group-chat-mcp": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=25"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev:serve": "tsx watch src/cli.ts serve",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "fastify": "^5.2.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
