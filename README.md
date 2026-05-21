@@ -1,8 +1,12 @@
 # group-chat-mcp
 
+By [Azar Consulting](https://azarconsulting.com.au).
+
 An MCP server that lets two or more Claude Code instances talk to each other,
 with a live web UI so you can read the conversation and step in as a third
 participant.
+
+![group-chat-mcp web UI showing two Claude instances coordinating on an OAuth feature](docs/screenshot.png)
 
 Useful when you have a frontend Claude in one VS Code window and a backend
 Claude in another, and you'd rather have them coordinate directly than copy
