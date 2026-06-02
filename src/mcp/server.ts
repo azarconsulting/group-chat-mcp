@@ -3,9 +3,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import type { Message } from "../shared/types.js";
 import { BrokerClient, BrokerError } from "./client.js";
+import { ensureBrokerRunning } from "./launch.js";
 
 export interface McpRuntimeOptions {
-  brokerUrl: string;
+  preferredPort: number;
+  /**
+   * If set, skip auto-spawn and always connect to this URL. Used by the
+   * `GROUP_CHAT_URL` env var to point at an externally-managed broker.
+   */
+  brokerUrlOverride?: string;
 }
 
 interface SessionState {
@@ -13,8 +19,53 @@ interface SessionState {
   peer: string | null;
 }
 
+const CONN_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "EPIPE",
+]);
+
+function isConnectionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.message === "fetch failed") return true;
+  const cause = (err as { cause?: { code?: string } }).cause;
+  if (cause && typeof cause.code === "string" && CONN_ERROR_CODES.has(cause.code)) return true;
+  return false;
+}
+
 export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
-  const broker = new BrokerClient(opts.brokerUrl);
+  let brokerClient: BrokerClient | null = null;
+
+  const getBroker = async (): Promise<BrokerClient> => {
+    if (brokerClient) return brokerClient;
+    const url =
+      opts.brokerUrlOverride ??
+      (await ensureBrokerRunning({ preferredPort: opts.preferredPort })).url;
+    brokerClient = new BrokerClient(url);
+    return brokerClient;
+  };
+
+  // Run a broker call. If it fails with a connection-class error (e.g. the
+  // broker has grace-exited since we last spoke to it), discard the cached
+  // client, re-run ensureBrokerRunning to spawn a fresh broker, and retry once.
+  // Higher-level errors (BrokerError 404/409 etc.) propagate to the caller —
+  // see withStateRecovery for room/peer-gone handling.
+  const withBroker = async <T>(fn: (c: BrokerClient) => Promise<T>): Promise<T> => {
+    const client = await getBroker();
+    try {
+      return await fn(client);
+    } catch (err) {
+      if (!isConnectionError(err)) throw err;
+      brokerClient = null;
+      const fresh = await getBroker();
+      return fn(fresh);
+    }
+  };
+
   const state: SessionState = { room: null, peer: null };
 
   const server = new McpServer({
@@ -31,7 +82,7 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
       inputSchema: {},
     },
     async () => {
-      const rooms = await broker.listRooms();
+      const rooms = await withBroker((c) => c.listRooms());
       if (rooms.length === 0) {
         return text("No rooms exist yet. Use join_room to create one.");
       }
@@ -73,7 +124,7 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
           true,
         );
       }
-      const result = await broker.joinRoom(room, as);
+      const result = await withBroker((c) => c.joinRoom(room, as));
       state.room = result.room;
       state.peer = result.assigned_peer;
       const otherPeers = result.peers.filter((p) => p !== state.peer);
@@ -104,7 +155,9 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
     },
     async ({ text: body }) =>
       withStateRecovery(state, async () => {
-        const r = await broker.sendMessage(state.room!, state.peer!, body);
+        const r = await withBroker((c) =>
+          c.sendMessage(state.room!, state.peer!, body),
+        );
         return text(`Sent (id ${r.id} at ${r.at}).`);
       }),
   );
@@ -134,10 +187,8 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
     },
     async ({ timeout_s }) =>
       withStateRecovery(state, async () => {
-        const result = await broker.waitForMessage(
-          state.room!,
-          state.peer!,
-          timeout_s ?? 60,
+        const result = await withBroker((c) =>
+          c.waitForMessage(state.room!, state.peer!, timeout_s ?? 60),
         );
         return text(formatMessages(result.messages, result.timed_out));
       }),
@@ -162,7 +213,9 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
     },
     async ({ count }) =>
       withStateRecovery(state, async () => {
-        const result = await broker.getLastMessages(state.room!, state.peer!, count ?? 1);
+        const result = await withBroker((c) =>
+          c.getLastMessages(state.room!, state.peer!, count ?? 1),
+        );
         return text(formatMessages(result.messages, false));
       }),
   );
@@ -183,10 +236,10 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
       state.room = null;
       state.peer = null;
       try {
-        await broker.leaveRoom(room, peer);
+        await withBroker((c) => c.leaveRoom(room, peer));
         return text(`Left room '${room}'.`);
       } catch (err) {
-        if (err instanceof BrokerError && err.statusCode === 404) {
+        if (err instanceof BrokerError && (err.statusCode === 404 || err.statusCode === 409)) {
           return text(`Room '${room}' no longer exists.`);
         }
         throw err;
@@ -194,10 +247,12 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
     },
   );
 
+  // Best-effort leave on shutdown. Skip if we never connected — no need to
+  // respawn a broker just to tell it we're going away.
   const cleanup = async () => {
-    if (state.room && state.peer) {
+    if (state.room && state.peer && brokerClient) {
       try {
-        await broker.leaveRoom(state.room, state.peer);
+        await brokerClient.leaveRoom(state.room, state.peer);
       } catch {
         // best effort
       }
@@ -236,8 +291,8 @@ async function withStateRecovery(
       state.room = null;
       state.peer = null;
       return text(
-        `You are no longer connected (${wasIn}). The room was deleted or you were kicked. ` +
-          `Call join_room to rejoin if appropriate.`,
+        `You are no longer connected (${wasIn}). The room was deleted, you were kicked, ` +
+          `or the broker restarted. Call join_room to rejoin if appropriate.`,
         true,
       );
     }

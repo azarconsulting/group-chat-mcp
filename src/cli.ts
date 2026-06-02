@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { startBroker } from "./broker/server.js";
-import { ensureBrokerRunning } from "./mcp/launch.js";
 import { runMcpServer } from "./mcp/server.js";
 
 const DEFAULT_PORT = 7531;
@@ -27,12 +26,10 @@ async function main() {
 
   if (subcommand === "mcp") {
     const port = parsePort(rest);
-    let brokerUrl = process.env.GROUP_CHAT_URL;
-    if (!brokerUrl) {
-      const handle = await ensureBrokerRunning({ preferredPort: port });
-      brokerUrl = handle.url;
-    }
-    await runMcpServer({ brokerUrl });
+    await runMcpServer({
+      preferredPort: port,
+      brokerUrlOverride: process.env.GROUP_CHAT_URL,
+    });
     return;
   }
 

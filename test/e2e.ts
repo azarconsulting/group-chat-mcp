@@ -54,17 +54,16 @@ async function main() {
   log("setup", "compiled cli:", COMPILED_CLI);
   assert(existsSync(COMPILED_CLI), "compiled cli missing — run `npm run build`");
 
-  log("step", "spawning frontend MCP client (should auto-spawn broker)");
+  log("step", "spawning frontend MCP client (broker is lazy — should NOT exist yet)");
   const fe = await newClient("frontend");
 
-  // Give the broker a moment to write the lockfile.
-  await sleep(500);
-  const lock = readLockfile();
-  log("check", "lockfile after first MCP start:", lock);
-  assert(lock, "broker should have written a lockfile");
-  assert(lock.port === 7531, `lockfile port should be 7531, got ${lock.port}`);
+  await sleep(300);
+  assert(
+    !existsSync(lockfilePath()),
+    "broker should not be running before any tool call (lazy spawn)",
+  );
 
-  log("step", "listing tools from frontend client");
+  log("step", "listing tools from frontend client (must not spawn broker)");
   const tools = await fe.client.listTools();
   const toolNames = tools.tools.map((t) => t.name).sort();
   log("check", "tools exposed:", toolNames.join(", "));
@@ -76,11 +75,21 @@ async function main() {
     "send_message",
     "wait_for_message",
   ]);
+  assert(
+    !existsSync(lockfilePath()),
+    "listTools should not have spawned the broker",
+  );
 
-  log("step", "frontend lists rooms (empty)");
+  log("step", "frontend lists rooms (first broker call — triggers lazy spawn)");
   let out = await callTool(fe.client, "list_rooms");
   log("output", out);
   assert.match(out, /No rooms/);
+
+  await sleep(200);
+  const lock = readLockfile();
+  log("check", "lockfile after first tool call:", lock);
+  assert(lock, "broker should be running after first broker call");
+  assert(lock.port === 7531, `lockfile port should be 7531, got ${lock.port}`);
 
   log("step", "frontend joins room 'feature-x'");
   out = await callTool(fe.client, "join_room", { room: "feature-x", as: "frontend" });
@@ -138,14 +147,36 @@ async function main() {
   log("output", out);
   assert.match(out, /Left room 'feature-x'/);
 
+  log("step", "killing broker mid-session to exercise lazy-respawn-on-connection-failure");
+  const brokerPidBeforeKill = lock.pid;
+  try {
+    process.kill(brokerPidBeforeKill, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  // Give the broker time to actually exit before the next fetch.
+  await sleep(500);
+
+  log("step", "next tool call should transparently respawn the broker");
+  out = await callTool(fe.client, "list_rooms");
+  log("output", out);
+  assert.match(out, /No rooms/);
+  await sleep(200);
+  const lockAfter = readLockfile();
+  assert(lockAfter, "broker should be running again after respawn");
+  assert(
+    lockAfter.pid !== brokerPidBeforeKill,
+    `respawned broker should have a different pid (was ${brokerPidBeforeKill}, now ${lockAfter.pid})`,
+  );
+
   log("step", "closing both clients");
   await fe.close();
   await be.close();
 
-  log("check", "broker should still be running during 30s grace period");
+  log("check", "respawned broker should still be running during 30s grace period");
   await sleep(300);
   const lock3 = readLockfile();
-  assert(lock3 && lock3.pid === lock.pid, "broker should still be alive in grace period");
+  assert(lock3 && lock3.pid === lockAfter.pid, "broker should still be alive in grace period");
 
   log("cleanup", "killing broker pid", lock3.pid);
   try {

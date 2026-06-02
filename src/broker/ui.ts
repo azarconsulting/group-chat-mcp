@@ -154,10 +154,12 @@ export const UI_HTML = String.raw`<!doctype html>
     display: flex; flex-direction: column; gap: 8px;
   }
   .msg { display: grid; grid-template-columns: 120px 1fr; gap: 12px; padding: 6px 0; }
-  .msg .who { color: var(--accent); font-weight: 600; }
+  .msg .who { color: var(--accent); font-weight: 600; font-size: 16px; }
   .msg.from-human .who { color: var(--human); }
-  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .body { white-space: pre-wrap; word-break: break-word; font-size: 16px; line-height: 1.45; }
   .msg .body .ts { color: var(--muted); font-size: 11px; margin-left: 8px; }
+  .msg .body .mention { color: var(--accent); font-weight: 600; }
+  .msg.from-human .body .mention { color: var(--human); }
 
   .placeholder { color: var(--muted); text-align: center; padding: 48px 24px; }
 
@@ -167,6 +169,7 @@ export const UI_HTML = String.raw`<!doctype html>
     border-top: 1px solid var(--border);
     background: var(--panel);
     flex: 0 0 auto;
+    position: relative;
   }
   #toast { flex: 0 0 auto; }
   form#composer input[name="name"] {
@@ -180,12 +183,12 @@ export const UI_HTML = String.raw`<!doctype html>
   }
   form#composer input[name="text"] {
     flex: 1;
-    padding: 8px 10px;
+    padding: 10px 12px;
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
     border-radius: 4px;
-    font-size: 14px;
+    font-size: 16px;
   }
   form#composer button {
     padding: 8px 16px;
@@ -225,6 +228,50 @@ export const UI_HTML = String.raw`<!doctype html>
     cursor: pointer;
     font-size: 14px;
   }
+
+  #mentions-dropdown {
+    position: absolute;
+    bottom: calc(100% - 4px);
+    left: 16px;
+    right: 16px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    display: none;
+    z-index: 100;
+  }
+  #mentions-dropdown.open { display: block; }
+  #mentions-dropdown .mention-hint {
+    padding: 6px 12px;
+    color: var(--muted);
+    font-size: 11px;
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .mention-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+  }
+  .mention-item .at { color: var(--muted); }
+  .mention-item .name { color: var(--text); }
+  .mention-item.active,
+  .mention-item:hover {
+    background: var(--accent);
+  }
+  .mention-item.active .at,
+  .mention-item.active .name,
+  .mention-item:hover .at,
+  .mention-item:hover .name {
+    color: var(--bg);
+  }
 </style>
 </head>
 <body>
@@ -250,6 +297,7 @@ export const UI_HTML = String.raw`<!doctype html>
       </div>
       <div id="toast"></div>
       <form id="composer" autocomplete="off">
+        <div id="mentions-dropdown"></div>
         <input name="name" placeholder="your name" value="human" />
         <input name="text" placeholder="join a room to chat..." disabled />
         <button type="submit" disabled>Send</button>
@@ -272,15 +320,18 @@ export const UI_HTML = String.raw`<!doctype html>
     sendBtn: document.querySelector('#composer button'),
     newRoomForm: document.getElementById("new-room"),
     newRoomInput: document.querySelector('#new-room input[name="room"]'),
+    mentionsDropdown: document.getElementById("mentions-dropdown"),
   };
 
   let ws = null;
   let currentRoom = null;       // room name we're currently viewing
   let assignedPeer = null;      // peer name the broker gave us
+  let currentPeers = [];        // last known peer list for currentRoom
   let rooms = [];               // last known rooms list
   let backoff = 500;
   let shutdownDeadline = null;  // epoch ms when broker plans to exit
   let countdownInterval = null;
+  let mentionState = null;      // { start, query, items, selectedIndex } when @ dropdown open
 
   function connect() {
     ws = new WebSocket(wsUrl);
@@ -340,21 +391,26 @@ export const UI_HTML = String.raw`<!doctype html>
       case "subscribed":
         currentRoom = msg.room;
         assignedPeer = msg.assigned_peer;
+        currentPeers = msg.peers;
+        els.nameInput.value = msg.assigned_peer;
         els.roomTitle.textContent = msg.room + "  (you: " + msg.assigned_peer + ")";
         renderPeers(msg.peers);
         renderMessages(msg.messages);
         setComposerEnabled(true);
         els.textInput.focus();
         renderRooms();
+        closeMentions();
         break;
       case "unsubscribed":
         currentRoom = null;
         assignedPeer = null;
+        currentPeers = [];
         els.roomTitle.textContent = "— no room selected —";
         els.roomPeers.textContent = "";
         els.messages.innerHTML = '<div class="placeholder">Pick a room from the left.</div>';
         setComposerEnabled(false);
         renderRooms();
+        closeMentions();
         break;
       case "message":
         if (msg.message.room === currentRoom) {
@@ -362,7 +418,11 @@ export const UI_HTML = String.raw`<!doctype html>
         }
         break;
       case "peers":
-        if (msg.room === currentRoom) renderPeers(msg.peers);
+        if (msg.room === currentRoom) {
+          currentPeers = msg.peers;
+          renderPeers(msg.peers);
+          if (mentionState) refreshMentionItems();
+        }
         break;
       case "error":
         toast(msg.error);
@@ -530,7 +590,7 @@ export const UI_HTML = String.raw`<!doctype html>
     div.appendChild(who);
     const body = document.createElement("div");
     body.className = "body";
-    body.textContent = m.text;
+    renderBodyText(body, m.text);
     const ts = document.createElement("span");
     ts.className = "ts";
     ts.textContent = new Date(m.at).toLocaleTimeString();
@@ -540,12 +600,32 @@ export const UI_HTML = String.raw`<!doctype html>
     if (scroll) scrollToBottom();
   }
 
+  function renderBodyText(el, text) {
+    const pattern = /@[\w-]+/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        el.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      const span = document.createElement("span");
+      span.className = "mention";
+      span.textContent = match[0];
+      el.appendChild(span);
+      lastIndex = pattern.lastIndex;
+    }
+    if (lastIndex < text.length) {
+      el.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+  }
+
   function scrollToBottom() {
     els.messages.scrollTop = els.messages.scrollHeight;
   }
 
   els.composer.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (mentionState) { closeMentions(); return; }
     const text = els.textInput.value.trim();
     if (!text || !currentRoom) return;
     send({ type: "send", text });
@@ -559,6 +639,155 @@ export const UI_HTML = String.raw`<!doctype html>
     const as = (els.nameInput.value || "human").trim() || "human";
     send({ type: "subscribe", room, as });
     els.newRoomInput.value = "";
+  });
+
+  // Rename the active peer when the name input is edited (commits on blur/Enter).
+  els.nameInput.addEventListener("change", () => {
+    const desired = (els.nameInput.value || "").trim();
+    if (!desired) {
+      els.nameInput.value = assignedPeer || "human";
+      return;
+    }
+    if (!currentRoom || desired === assignedPeer) return;
+    send({ type: "subscribe", room: currentRoom, as: desired });
+  });
+
+  // --- @-mention dropdown -------------------------------------------------
+  function currentMentionToken() {
+    const value = els.textInput.value;
+    const cursor = els.textInput.selectionStart;
+    if (cursor === null || cursor === undefined) return null;
+    let i = cursor - 1;
+    while (i >= 0 && !/\s/.test(value[i])) {
+      if (value[i] === "@") {
+        if (i === 0 || /\s/.test(value[i - 1])) {
+          return { start: i, query: value.slice(i + 1, cursor) };
+        }
+        return null;
+      }
+      i--;
+    }
+    return null;
+  }
+
+  function mentionCandidates(query) {
+    const q = query.toLowerCase();
+    return currentPeers
+      .filter((p) => p !== assignedPeer)
+      .filter((p) => p.toLowerCase().includes(q));
+  }
+
+  function updateMentions() {
+    const token = currentMentionToken();
+    if (!token) { closeMentions(); return; }
+    const items = mentionCandidates(token.query);
+    if (items.length === 0) { closeMentions(); return; }
+    if (mentionState && mentionState.start === token.start) {
+      mentionState.query = token.query;
+      mentionState.items = items;
+      mentionState.selectedIndex = Math.min(mentionState.selectedIndex, items.length - 1);
+    } else {
+      mentionState = { start: token.start, query: token.query, items, selectedIndex: 0 };
+    }
+    renderMentions();
+  }
+
+  function refreshMentionItems() {
+    if (!mentionState) return;
+    const items = mentionCandidates(mentionState.query);
+    if (items.length === 0) { closeMentions(); return; }
+    mentionState.items = items;
+    mentionState.selectedIndex = Math.min(mentionState.selectedIndex, items.length - 1);
+    renderMentions();
+  }
+
+  function renderMentions() {
+    if (!mentionState) {
+      els.mentionsDropdown.classList.remove("open");
+      els.mentionsDropdown.innerHTML = "";
+      return;
+    }
+    els.mentionsDropdown.innerHTML = "";
+    const hint = document.createElement("div");
+    hint.className = "mention-hint";
+    hint.textContent = "↑↓ navigate · Enter to insert · Esc to close";
+    els.mentionsDropdown.appendChild(hint);
+    for (let i = 0; i < mentionState.items.length; i++) {
+      const peer = mentionState.items[i];
+      const item = document.createElement("div");
+      item.className = "mention-item" + (i === mentionState.selectedIndex ? " active" : "");
+      const at = document.createElement("span");
+      at.className = "at";
+      at.textContent = "@";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = peer;
+      item.appendChild(at);
+      item.appendChild(name);
+      item.addEventListener("mousedown", (e) => {
+        // Prevent the input from losing focus before we read its selection.
+        e.preventDefault();
+        commitMention(i);
+      });
+      els.mentionsDropdown.appendChild(item);
+    }
+    els.mentionsDropdown.classList.add("open");
+  }
+
+  function closeMentions() {
+    mentionState = null;
+    els.mentionsDropdown.classList.remove("open");
+    els.mentionsDropdown.innerHTML = "";
+  }
+
+  function commitMention(index) {
+    if (!mentionState) return;
+    const peer = mentionState.items[index];
+    if (!peer) return;
+    const value = els.textInput.value;
+    const before = value.slice(0, mentionState.start);
+    let tokenEnd = mentionState.start + 1;
+    while (tokenEnd < value.length && !/\s/.test(value[tokenEnd])) tokenEnd++;
+    const after = value.slice(tokenEnd);
+    const insertion = "@" + peer + " ";
+    els.textInput.value = before + insertion + after;
+    const newCursor = before.length + insertion.length;
+    els.textInput.setSelectionRange(newCursor, newCursor);
+    els.textInput.focus();
+    closeMentions();
+  }
+
+  els.textInput.addEventListener("input", updateMentions);
+  els.textInput.addEventListener("click", updateMentions);
+  els.textInput.addEventListener("keyup", (e) => {
+    // Update on cursor moves that don't fire 'input'.
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") {
+      updateMentions();
+    }
+  });
+  els.textInput.addEventListener("keydown", (e) => {
+    if (!mentionState) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      mentionState.selectedIndex = (mentionState.selectedIndex + 1) % mentionState.items.length;
+      renderMentions();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      mentionState.selectedIndex = (mentionState.selectedIndex - 1 + mentionState.items.length) % mentionState.items.length;
+      renderMentions();
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      commitMention(mentionState.selectedIndex);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeMentions();
+    }
+  });
+  els.textInput.addEventListener("blur", () => {
+    // Allow mousedown selection (which fires before blur) to commit first.
+    setTimeout(() => {
+      if (document.activeElement !== els.textInput) closeMentions();
+    }, 120);
   });
 
   connect();
