@@ -1,6 +1,6 @@
 {
   "name": "group-chat-mcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "MCP server letting multiple Claude Code instances chat with each other, with a live web UI.",
   "type": "module",
   "license": "MIT",

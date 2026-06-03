@@ -165,6 +165,7 @@ export const UI_HTML = String.raw`<!doctype html>
 
   form#composer {
     display: flex; gap: 8px;
+    align-items: flex-end;
     padding: 12px 16px;
     border-top: 1px solid var(--border);
     background: var(--panel);
@@ -181,14 +182,21 @@ export const UI_HTML = String.raw`<!doctype html>
     border-radius: 4px;
     font-size: 13px;
   }
-  form#composer input[name="text"] {
+  form#composer textarea[name="text"] {
     flex: 1;
+    min-width: 0;
     padding: 10px 12px;
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
     border-radius: 4px;
     font-size: 16px;
+    font-family: inherit;
+    line-height: 1.4;
+    resize: none;
+    overflow-y: auto;
+    min-height: 44px;
+    max-height: 220px;
   }
   form#composer button {
     padding: 8px 16px;
@@ -299,7 +307,7 @@ export const UI_HTML = String.raw`<!doctype html>
       <form id="composer" autocomplete="off">
         <div id="mentions-dropdown"></div>
         <input name="name" placeholder="your name" value="human" />
-        <input name="text" placeholder="join a room to chat..." disabled />
+        <textarea name="text" rows="1" placeholder="join a room to chat..." disabled></textarea>
         <button type="submit" disabled>Send</button>
       </form>
     </main>
@@ -316,7 +324,7 @@ export const UI_HTML = String.raw`<!doctype html>
     toast: document.getElementById("toast"),
     composer: document.getElementById("composer"),
     nameInput: document.querySelector('#composer input[name="name"]'),
-    textInput: document.querySelector('#composer input[name="text"]'),
+    textInput: document.querySelector('#composer [name="text"]'),
     sendBtn: document.querySelector('#composer button'),
     newRoomForm: document.getElementById("new-room"),
     newRoomInput: document.querySelector('#new-room input[name="room"]'),
@@ -630,7 +638,13 @@ export const UI_HTML = String.raw`<!doctype html>
     if (!text || !currentRoom) return;
     send({ type: "send", text });
     els.textInput.value = "";
+    autoResize();
   });
+
+  function autoResize() {
+    els.textInput.style.height = "auto";
+    els.textInput.style.height = els.textInput.scrollHeight + "px";
+  }
 
   els.newRoomForm.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -754,10 +768,14 @@ export const UI_HTML = String.raw`<!doctype html>
     const newCursor = before.length + insertion.length;
     els.textInput.setSelectionRange(newCursor, newCursor);
     els.textInput.focus();
+    autoResize();
     closeMentions();
   }
 
-  els.textInput.addEventListener("input", updateMentions);
+  els.textInput.addEventListener("input", () => {
+    autoResize();
+    updateMentions();
+  });
   els.textInput.addEventListener("click", updateMentions);
   els.textInput.addEventListener("keyup", (e) => {
     // Update on cursor moves that don't fire 'input'.
@@ -766,21 +784,32 @@ export const UI_HTML = String.raw`<!doctype html>
     }
   });
   els.textInput.addEventListener("keydown", (e) => {
-    if (!mentionState) return;
-    if (e.key === "ArrowDown") {
+    if (mentionState) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        mentionState.selectedIndex = (mentionState.selectedIndex + 1) % mentionState.items.length;
+        renderMentions();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        mentionState.selectedIndex = (mentionState.selectedIndex - 1 + mentionState.items.length) % mentionState.items.length;
+        renderMentions();
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        commitMention(mentionState.selectedIndex);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeMentions();
+      }
+      return;
+    }
+    // Plain Enter sends; Shift+Enter (and other modifiers) inserts a newline.
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
-      mentionState.selectedIndex = (mentionState.selectedIndex + 1) % mentionState.items.length;
-      renderMentions();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      mentionState.selectedIndex = (mentionState.selectedIndex - 1 + mentionState.items.length) % mentionState.items.length;
-      renderMentions();
-    } else if (e.key === "Enter" || e.key === "Tab") {
-      e.preventDefault();
-      commitMention(mentionState.selectedIndex);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      closeMentions();
+      if (typeof els.composer.requestSubmit === "function") {
+        els.composer.requestSubmit();
+      } else {
+        els.composer.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+      }
     }
   });
   els.textInput.addEventListener("blur", () => {

@@ -105,7 +105,13 @@ export async function runMcpServer(opts: McpRuntimeOptions): Promise<void> {
         "Join a group-chat room as the given peer name. Creates the room if it doesn't exist. " +
         "If your preferred name is taken, the broker assigns a numbered suffix (e.g. `frontend-2`). " +
         "Returns your assigned peer name — use this for all subsequent calls. " +
-        "You will see only messages sent AFTER you join (cold join).",
+        "You will see only messages sent AFTER you join (cold join)." +
+        "\n\n" +
+        "After joining, IMMEDIATELY enter the receive loop: call `wait_for_message` and keep " +
+        "responding to incoming messages, then calling `wait_for_message` again. Do not stop " +
+        "after just joining — other peers (including the human) may be waiting to talk to you. " +
+        "The loop ends naturally when `wait_for_message` returns with no new messages (timeout); " +
+        "at that point, report back that the room has gone quiet.",
       inputSchema: {
         room: z.string().min(1).describe("Room name. Auto-created if missing."),
         as: z
