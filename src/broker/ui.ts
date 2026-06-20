@@ -1,6 +1,232 @@
 // Inlined single-page web UI. Served at GET /.
 // Kept as a TS module string so it travels with the compiled output regardless of cwd.
 
+// Pure, DOM-free Markdown parser. Lives here as a source string so the exact
+// same code runs in two places: inlined into UI_HTML for the browser, and
+// eval'd by test/markdown.ts in plain Node. It must never touch the DOM or any
+// browser global — it only turns text into a small AST of plain objects. The
+// DOM layer (renderInline/renderBlocks below, inside the page script) walks
+// that AST with createElement/createTextNode and NEVER assigns innerHTML, so
+// the message rendering stays XSS-safe by construction.
+export const MARKDOWN_SRC = String.raw`
+const GCMD_TICK = String.fromCharCode(96);
+
+function gcmdIsSpace(ch) {
+  return ch === undefined || /\s/.test(ch);
+}
+
+// Scheme allowlist for links. Anything else (javascript:, data:, ...) is not a
+// link and degrades to literal text, so a hostile href can never become live.
+function gcmdSafeHref(raw) {
+  const url = String(raw).trim();
+  if (/^https?:\/\//i.test(url)) return url;
+  if (/^mailto:[^\s]+$/i.test(url)) return url;
+  return null;
+}
+
+// Find a closing emphasis/strike delimiter that is "right-flanking" (preceded
+// by a non-space) and, for underscores, not intra-word — so snake_case and
+// "a * b" don't turn into emphasis.
+function gcmdFindClosingFlanked(text, from, marker, underscore) {
+  let pos = from;
+  while (true) {
+    const idx = text.indexOf(marker, pos);
+    if (idx === -1) return -1;
+    if (idx === from) { pos = idx + 1; continue; }            // empty span
+    if (gcmdIsSpace(text[idx - 1])) { pos = idx + marker.length; continue; }
+    if (underscore) {
+      const after = text[idx + marker.length];
+      if (after !== undefined && /[A-Za-z0-9]/.test(after)) { pos = idx + marker.length; continue; }
+    }
+    return idx;
+  }
+}
+
+function gcmdTryEmphasis(text, i) {
+  const c = text[i];
+  if (c === "~") {
+    if (text[i + 1] !== "~") return null;
+    if (gcmdIsSpace(text[i + 2])) return null;
+    const close = gcmdFindClosingFlanked(text, i + 2, "~~", false);
+    if (close === -1) return null;
+    return { node: { type: "del", children: gcmdParseInline(text.slice(i + 2, close)) }, end: close + 2 };
+  }
+  if (c !== "*" && c !== "_") return null;
+  const underscore = c === "_";
+  if (underscore) {
+    const prev = i === 0 ? "" : text[i - 1];
+    if (/[A-Za-z0-9]/.test(prev)) return null;                // no intra-word underscore opener
+  }
+  const dbl = text[i + 1] === c;
+  const marker = dbl ? c + c : c;
+  const contentStart = i + marker.length;
+  if (gcmdIsSpace(text[contentStart])) return null;           // opener must hug its content
+  const close = gcmdFindClosingFlanked(text, contentStart, marker, underscore);
+  if (close === -1) return null;
+  const children = gcmdParseInline(text.slice(contentStart, close));
+  return { node: { type: dbl ? "strong" : "em", children: children }, end: close + marker.length };
+}
+
+function gcmdTryLink(text, i) {
+  const close = text.indexOf("]", i + 1);
+  if (close === -1 || text[close + 1] !== "(") return null;
+  const paren = text.indexOf(")", close + 2);
+  if (paren === -1) return null;
+  const href = gcmdSafeHref(text.slice(close + 2, paren));
+  if (href === null) {
+    return { node: { type: "text", value: text.slice(i, paren + 1) }, end: paren + 1 };
+  }
+  return { node: { type: "link", href: href, children: gcmdParseInline(text.slice(i + 1, close)) }, end: paren + 1 };
+}
+
+// Inline pass: bold, italic, code, strikethrough, links, @mentions.
+function gcmdParseInline(text) {
+  const nodes = [];
+  let buf = "";
+  let i = 0;
+  const flush = () => { if (buf) { nodes.push({ type: "text", value: buf }); buf = ""; } };
+  while (i < text.length) {
+    const c = text[i];
+    if (c === GCMD_TICK) {                                     // inline code span (literal inside)
+      let run = 1;
+      while (text[i + run] === GCMD_TICK) run++;
+      const ticks = text.substr(i, run);
+      const close = text.indexOf(ticks, i + run);
+      if (close !== -1) {
+        flush();
+        let code = text.slice(i + run, close);
+        if (code.length > 1 && code[0] === " " && code[code.length - 1] === " " && /[^ ]/.test(code)) {
+          code = code.slice(1, -1);
+        }
+        nodes.push({ type: "code", value: code });
+        i = close + run;
+        continue;
+      }
+      buf += c; i++; continue;
+    }
+    if (c === "[") {
+      const link = gcmdTryLink(text, i);
+      if (link) { flush(); nodes.push(link.node); i = link.end; continue; }
+      buf += c; i++; continue;
+    }
+    if (c === "*" || c === "_" || c === "~") {
+      const emph = gcmdTryEmphasis(text, i);
+      if (emph) { flush(); nodes.push(emph.node); i = emph.end; continue; }
+      buf += c; i++; continue;
+    }
+    if (c === "@" && (i === 0 || gcmdIsSpace(text[i - 1]))) {
+      const m = /^@[\w-]+/.exec(text.slice(i));
+      if (m) { flush(); nodes.push({ type: "mention", value: m[0] }); i += m[0].length; continue; }
+      buf += c; i++; continue;
+    }
+    buf += c; i++;
+  }
+  flush();
+  return nodes;
+}
+
+// A paragraph's lines join with hard breaks (GitHub-comment style) so the chat
+// keeps its line-by-line feel.
+function gcmdInlineLines(lines) {
+  const out = [];
+  for (let k = 0; k < lines.length; k++) {
+    if (k > 0) out.push({ type: "break" });
+    const nodes = gcmdParseInline(lines[k]);
+    for (let j = 0; j < nodes.length; j++) out.push(nodes[j]);
+  }
+  return out;
+}
+
+function gcmdFenceInfo(line) {
+  let k = 0;
+  while (k < 3 && line[k] === " ") k++;
+  let t = 0;
+  while (line[k + t] === GCMD_TICK) t++;
+  if (t < 3) return null;
+  return { len: t, lang: line.slice(k + t).trim() };
+}
+
+function gcmdIsFenceClose(line, len) {
+  let k = 0;
+  while (k < 3 && line[k] === " ") k++;
+  let t = 0;
+  while (line[k + t] === GCMD_TICK) t++;
+  return t >= len && /^\s*$/.test(line.slice(k + t));
+}
+
+function gcmdListItem(line) {
+  let m = /^\s{0,3}([-*+])\s+(.*)$/.exec(line);
+  if (m) return { ordered: false, content: m[2] };
+  m = /^\s{0,3}(\d+)[.)]\s+(.*)$/.exec(line);
+  if (m) return { ordered: true, content: m[2] };
+  return null;
+}
+
+// Block pass: paragraphs, fenced code, headings (capped at h3), blockquotes,
+// and bullet/ordered lists.
+function parseMessage(text) {
+  const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+
+    const fence = gcmdFenceInfo(line);
+    if (fence) {
+      i++;
+      const code = [];
+      while (i < lines.length && !gcmdIsFenceClose(lines[i], fence.len)) { code.push(lines[i]); i++; }
+      if (i < lines.length) i++;                              // consume closing fence
+      blocks.push({ type: "code_block", lang: fence.lang, value: code.join("\n") });
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      blocks.push({ type: "heading", level: Math.min(heading[1].length, 3), children: gcmdParseInline(heading[2].trim()) });
+      i++;
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quoted = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) { quoted.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+      blocks.push({ type: "blockquote", children: parseMessage(quoted.join("\n")) });
+      continue;
+    }
+
+    const item = gcmdListItem(line);
+    if (item) {
+      const ordered = item.ordered;
+      const items = [];
+      while (i < lines.length) {
+        const it = gcmdListItem(lines[i]);
+        if (!it || it.ordered !== ordered) break;
+        items.push(gcmdParseInline(it.content));
+        i++;
+      }
+      blocks.push({ type: "list", ordered: ordered, items: items });
+      continue;
+    }
+
+    const para = [];
+    while (i < lines.length) {
+      const pl = lines[i];
+      if (/^\s*$/.test(pl)) break;
+      if (gcmdFenceInfo(pl)) break;
+      if (/^(#{1,6})\s+/.test(pl)) break;
+      if (/^\s*>/.test(pl)) break;
+      if (gcmdListItem(pl)) break;
+      para.push(pl);
+      i++;
+    }
+    blocks.push({ type: "paragraph", children: gcmdInlineLines(para) });
+  }
+  return blocks;
+}
+`;
+
 export const UI_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
@@ -156,10 +382,55 @@ export const UI_HTML = String.raw`<!doctype html>
   .msg { display: grid; grid-template-columns: 120px 1fr; gap: 12px; padding: 6px 0; }
   .msg .who { color: var(--accent); font-weight: 600; font-size: 16px; }
   .msg.from-human .who { color: var(--human); }
-  .msg .body { white-space: pre-wrap; word-break: break-word; font-size: 16px; line-height: 1.45; }
+  .msg .body { word-break: break-word; font-size: 16px; line-height: 1.45; }
   .msg .body .ts { color: var(--muted); font-size: 11px; margin-left: 8px; }
   .msg .body .mention { color: var(--accent); font-weight: 600; }
   .msg.from-human .body .mention { color: var(--human); }
+
+  /* Rendered Markdown inside a message body. */
+  .md-p { margin: 0 0 8px; }
+  .md-p:last-child { margin-bottom: 0; }
+  .md-h { font-weight: 700; line-height: 1.3; margin: 4px 0 6px; }
+  .md-h1 { font-size: 1.3em; }
+  .md-h2 { font-size: 1.18em; }
+  .md-h3 { font-size: 1.06em; }
+  .md strong { font-weight: 700; }
+  .md em { font-style: italic; }
+  .md del { opacity: 0.65; }
+  .md a { color: var(--accent); text-decoration: underline; }
+  .md a:hover { color: var(--text); }
+  .md code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .md-pre {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 6px 0;
+    overflow-x: auto;
+  }
+  .md-pre code {
+    display: block;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 0.9em;
+    white-space: pre;
+  }
+  .md-quote {
+    margin: 6px 0;
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+  }
+  .md-list { margin: 6px 0; padding-left: 22px; }
+  .md-list li { margin: 2px 0; }
 
   .placeholder { color: var(--muted); text-align: center; padding: 48px 24px; }
 
@@ -313,6 +584,9 @@ export const UI_HTML = String.raw`<!doctype html>
     </main>
   </div>
 <script>
+${MARKDOWN_SRC}
+</script>
+<script>
 (() => {
   const wsUrl = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws";
   const els = {
@@ -331,6 +605,8 @@ export const UI_HTML = String.raw`<!doctype html>
     mentionsDropdown: document.getElementById("mentions-dropdown"),
   };
 
+  const BASE_TITLE = "group-chat-mcp";
+  let unread = false;           // a message arrived while the tab was unfocused
   let ws = null;
   let currentRoom = null;       // room name we're currently viewing
   let assignedPeer = null;      // peer name the broker gave us
@@ -390,6 +666,23 @@ export const UI_HTML = String.raw`<!doctype html>
     els.textInput.placeholder = on ? "type a message..." : "join a room to chat...";
   }
 
+  // True only when this tab is the one the user is actually looking at — covers
+  // both "switched to another tab" (hidden) and "switched to another window"
+  // (visible but not focused).
+  function isFocused() {
+    return document.visibilityState === "visible" && document.hasFocus();
+  }
+  function markUnread() {
+    if (unread) return;
+    unread = true;
+    document.title = "● " + BASE_TITLE;
+  }
+  function clearUnread() {
+    if (!unread) return;
+    unread = false;
+    document.title = BASE_TITLE;
+  }
+
   function handle(msg) {
     switch (msg.type) {
       case "rooms":
@@ -423,6 +716,7 @@ export const UI_HTML = String.raw`<!doctype html>
       case "message":
         if (msg.message.room === currentRoom) {
           appendMessage(msg.message);
+          if (!isFocused()) markUnread();
         }
         break;
       case "peers":
@@ -598,32 +892,119 @@ export const UI_HTML = String.raw`<!doctype html>
     div.appendChild(who);
     const body = document.createElement("div");
     body.className = "body";
-    renderBodyText(body, m.text);
+    const content = document.createElement("div");
+    content.className = "md";
+    renderBlocks(content, parseMessage(m.text));
+    body.appendChild(content);
     const ts = document.createElement("span");
     ts.className = "ts";
     ts.textContent = new Date(m.at).toLocaleTimeString();
-    body.appendChild(ts);
+    // Trail the timestamp on the last paragraph/heading so it sits inline after
+    // the text; for block-ish endings (code, list, quote) drop it on its own line.
+    const last = content.lastElementChild;
+    if (last && (last.classList.contains("md-p") || last.classList.contains("md-h"))) {
+      last.appendChild(ts);
+    } else {
+      content.appendChild(ts);
+    }
     div.appendChild(body);
     els.messages.appendChild(div);
     if (scroll) scrollToBottom();
   }
 
-  function renderBodyText(el, text) {
-    const pattern = /@[\w-]+/g;
-    let lastIndex = 0;
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      if (match.index > lastIndex) {
-        el.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+  // Walk the inline AST from parseMessage into DOM nodes. Never uses innerHTML,
+  // so message text can never inject markup — code spans set textContent and
+  // links only ever carry an allowlisted href.
+  function renderInline(parent, nodes) {
+    for (const node of nodes) {
+      switch (node.type) {
+        case "text":
+          parent.appendChild(document.createTextNode(node.value));
+          break;
+        case "break":
+          parent.appendChild(document.createElement("br"));
+          break;
+        case "code": {
+          const el = document.createElement("code");
+          el.textContent = node.value;
+          parent.appendChild(el);
+          break;
+        }
+        case "mention": {
+          const el = document.createElement("span");
+          el.className = "mention";
+          el.textContent = node.value;
+          parent.appendChild(el);
+          break;
+        }
+        case "link": {
+          const a = document.createElement("a");
+          a.href = node.href;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          renderInline(a, node.children);
+          parent.appendChild(a);
+          break;
+        }
+        case "strong":
+        case "em":
+        case "del": {
+          const tag = node.type === "strong" ? "strong" : node.type === "em" ? "em" : "del";
+          const el = document.createElement(tag);
+          renderInline(el, node.children);
+          parent.appendChild(el);
+          break;
+        }
       }
-      const span = document.createElement("span");
-      span.className = "mention";
-      span.textContent = match[0];
-      el.appendChild(span);
-      lastIndex = pattern.lastIndex;
     }
-    if (lastIndex < text.length) {
-      el.appendChild(document.createTextNode(text.slice(lastIndex)));
+  }
+
+  // Walk the block AST into DOM nodes.
+  function renderBlocks(container, blocks) {
+    for (const b of blocks) {
+      switch (b.type) {
+        case "paragraph": {
+          const p = document.createElement("p");
+          p.className = "md-p";
+          renderInline(p, b.children);
+          container.appendChild(p);
+          break;
+        }
+        case "heading": {
+          const h = document.createElement("div");
+          h.className = "md-h md-h" + b.level;
+          renderInline(h, b.children);
+          container.appendChild(h);
+          break;
+        }
+        case "code_block": {
+          const pre = document.createElement("pre");
+          pre.className = "md-pre";
+          const code = document.createElement("code");
+          code.textContent = b.value;
+          pre.appendChild(code);
+          container.appendChild(pre);
+          break;
+        }
+        case "blockquote": {
+          const bq = document.createElement("blockquote");
+          bq.className = "md-quote";
+          renderBlocks(bq, b.children);
+          container.appendChild(bq);
+          break;
+        }
+        case "list": {
+          const list = document.createElement(b.ordered ? "ol" : "ul");
+          list.className = "md-list";
+          for (const item of b.items) {
+            const li = document.createElement("li");
+            renderInline(li, item);
+            list.appendChild(li);
+          }
+          container.appendChild(list);
+          break;
+        }
+      }
     }
   }
 
@@ -818,6 +1199,10 @@ export const UI_HTML = String.raw`<!doctype html>
       if (document.activeElement !== els.textInput) closeMentions();
     }, 120);
   });
+
+  // Clear the unread dot the moment the user comes back to this tab/window.
+  document.addEventListener("visibilitychange", () => { if (isFocused()) clearUnread(); });
+  window.addEventListener("focus", () => { if (isFocused()) clearUnread(); });
 
   connect();
 })();
